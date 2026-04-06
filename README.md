@@ -1,0 +1,10 @@
+#----------------------------------------------[\]
+#BaluVision 7.0                                [-]
+#Created on April 4th 2026, by Balu            [|]
+#----------------------------------------------|/|
+#YoloV8 Nano Vision Model                      [|]
+#Downscaling to [240p]                         [|]
+#Detection every [0.1] seconds                 [-]
+#Minimum confidence [65%]                      [|]
+#Copyright: Free Use, Don't claim as your own. [|]
+#----------------------------------------------[\]
