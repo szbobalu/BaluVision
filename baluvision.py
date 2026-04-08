@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-BaluVision v7 — Live webcam AI detection
-Model  : YOLOv8 Nano (ultralytics)
+BaluVision v8.1 — Performance‑tuned live detection
+Model  : YOLOv8 (selectable) + Haar faces
 """
 import os, sys
 # suppress NNPACK "unsupported hardware" spam on old CPUs
@@ -12,6 +12,7 @@ os.dup2(devnull.fileno(), 2)
 
 import subprocess, threading, time, queue, logging, tkinter as tk
 from tkinter import ttk
+import importlib.util
 
 # ── logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -20,7 +21,7 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-log = logging.getLogger("smolvision")
+log = logging.getLogger("baluvision")
 log.info("Python %s  |  pid %d", sys.version.split()[0], os.getpid())
 
 # ── deps ─────────────────────────────────────────────────────────────────────
@@ -34,7 +35,7 @@ DEPS = [
 
 def _ensure_deps():
     missing = [(i, p) for i, p in DEPS
-               if not __import__("importlib").util.find_spec(i.split(".")[0])]
+               if not importlib.util.find_spec(i.split(".")[0])]
     if not missing:
         log.info("All deps present.")
         return
@@ -53,11 +54,11 @@ import numpy as np
 from PIL import Image, ImageTk
 import torch
 
-# Set CPU threads to 4
+# Set CPU threads to 2
 torch.set_num_threads(2)
 log.info("Torch CPU threads set to %d", torch.get_num_threads())
 
-# ── COCO-80 labels (YOLOv8 uses same order) ─────────────────────────────────
+# ── COCO-80 labels (correct spelling) ───────────────────────────────────────
 COCO = [
     "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck",
     "boat", "traffic light", "fire hydrant", "stop sign", "parking meter", "bench",
@@ -83,14 +84,13 @@ def _color(label_idx):           # returns BGR tuple for OpenCV
     return (b, g, r)
 
 # ── constants ─────────────────────────────────────────────────────────────────
-DISPLAY_W, DISPLAY_H = 640, 480
-INFER_INTERVAL       = 0.1       # seconds between detections
-THRESHOLD            = 0.65      # confidence cutoff
+DISPLAY_W, DISPLAY_H = 480, 360   # smaller display = faster UI
+INFER_INTERVAL       = 0.25       # seconds between detections (adjustable)
+THRESHOLD            = 0.50       # confidence cutoff
 MAX_CAM_IDX          = 6
 FACE_CASCADE         = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-
-# Downscale to 240p (height 240, width adjusted to keep aspect)
-INFER_WIDTH, INFER_HEIGHT = 256, 160   # 160p
+INFER_IMGSZ          = 160        # further downscaled for speed
+FRAME_SKIP           = 2          # run inference every N frames (1 = every frame)
 
 C = {
     "bg":    "#0a0c0a", "panel": "#0f130f", "border": "#1a2a1a",
@@ -98,6 +98,13 @@ C = {
     "warn":  "#e8c84a", "face":  "#00e5ff", "bar_bg": "#141e14",
 }
 
+# Available YOLOv8 models
+MODEL_OPTIONS = {
+    "YOLOv8 Nano":  "yolov8n.pt",
+    "YOLOv8 Small": "yolov8s.pt",
+    "YOLOv8 Medium":"yolov8m.pt",
+    "YOLOv8 Large": "yolov8l.pt",
+}
 
 # ── camera scan ───────────────────────────────────────────────────────────────
 def scan_cameras():
@@ -121,10 +128,11 @@ def scan_cameras():
 
 # ── model loader ──────────────────────────────────────────────────────────────
 class ModelLoader(threading.Thread):
-    def __init__(self, on_ready, on_status):
+    def __init__(self, on_ready, on_status, model_path):
         super().__init__(daemon=True, name="ModelLoader")
         self.on_ready  = on_ready
         self.on_status = on_status
+        self.model_path = model_path
 
     def run(self):
         try:
@@ -133,10 +141,10 @@ class ModelLoader(threading.Thread):
             from ultralytics import YOLO
             log.info("ultralytics imported in %.2fs", time.perf_counter() - t0)
 
-            self.on_status("Downloading YOLOv8n (~10 MB)…")
+            self.on_status(f"Loading {os.path.basename(self.model_path)} …")
             t1 = time.perf_counter()
-            model = YOLO("yolov8n.pt")
-            log.info("YOLOv8n ready in %.2fs", time.perf_counter() - t1)
+            model = YOLO(self.model_path)
+            log.info("%s ready in %.2fs", self.model_path, time.perf_counter() - t1)
 
             # Haar face cascade
             self.on_status("Loading face cascade…")
@@ -160,6 +168,11 @@ class InferenceWorker(threading.Thread):
         self._q      = queue.Queue(maxsize=1)
         self._stop   = threading.Event()
         self.cb      = None
+        # Lower thread priority if possible
+        try:
+            os.nice(10)
+        except:
+            pass
 
     def submit(self, frame_bgr, cb):
         self.cb = cb
@@ -182,7 +195,7 @@ class InferenceWorker(threading.Thread):
             try:
                 result = self._infer(frame)
                 result["elapsed"] = time.perf_counter() - t0
-                log.info("Inference %.3fs | detections=%d | faces=%d",
+                log.debug("Inference %.3fs | detections=%d | faces=%d",
                          result["elapsed"],
                          len(result["detections"]),
                          len(result["faces"]))
@@ -195,47 +208,39 @@ class InferenceWorker(threading.Thread):
                              "faces": [], "elapsed": 0})
 
     def _infer(self, frame_bgr):
-        # Downscale to 160p for faster inference
-        h, w = frame_bgr.shape[:2]
-        small = cv2.resize(frame_bgr, (INFER_WIDTH, INFER_HEIGHT), interpolation=cv2.INTER_LINEAR)
-
-        # YOLOv8 inference (returns list of Results objects)
-        results = self.model(small, imgsz=INFER_HEIGHT, conf=THRESHOLD, verbose=False)
+        # YOLOv8 inference – model handles resizing internally
+        results = self.model(frame_bgr, imgsz=INFER_IMGSZ, conf=THRESHOLD, verbose=False)
         dets = results[0].boxes
 
         detections = []
         if dets is not None:
-            boxes = dets.xyxy.cpu().numpy()   # [x1, y1, x2, y2] normalized to small size
+            boxes = dets.xyxy.cpu().numpy()
             scores = dets.conf.cpu().numpy()
             classes = dets.cls.cpu().numpy().astype(int)
-
-            # Scale boxes back to original frame dimensions
-            scale_x = w / INFER_WIDTH
-            scale_y = h / INFER_HEIGHT
 
             for box, score, cls in zip(boxes, scores, classes):
                 if score < THRESHOLD:
                     continue
                 name = COCO[cls] if cls < len(COCO) else "?"
-                x1, y1, x2, y2 = box
-                x1 = int(x1 * scale_x)
-                y1 = int(y1 * scale_y)
-                x2 = int(x2 * scale_x)
-                y2 = int(y2 * scale_y)
+                x1, y1, x2, y2 = map(int, box)
                 detections.append({
                     "label": name,
                     "score": float(score),
                     "box": (x1, y1, x2, y2),
                     "color": _color(cls),
+                    "class_idx": cls,
                 })
 
-        # Haar faces at half-res for speed
+        # Haar faces – downscale even more for speed
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        small_gray = cv2.resize(gray, (0, 0), fx=0.5, fy=0.5)
+        small_gray = cv2.resize(gray, (0, 0), fx=0.4, fy=0.4)  # 40% of original
         rects = self.cascade.detectMultiScale(
-            small_gray, scaleFactor=1.15, minNeighbors=4, minSize=(25, 25)
+            small_gray,
+            scaleFactor=1.2,       # faster scanning
+            minNeighbors=3,
+            minSize=(30, 30)
         )
-        faces = [tuple(int(v / 0.5) for v in rect)
+        faces = [tuple(int(v / 0.4) for v in rect)
                  for rect in (rects if len(rects) else [])]
 
         return {"detections": detections, "faces": faces}
@@ -253,9 +258,12 @@ class App:
         self._photo    = None
         self._result   = None
         self._cams     = []
-        self._frame_after_id = None   # Store after ID to cancel
+        self._frame_after_id = None
+        self._frame_counter = 0      # for frame skipping
+        self._last_seen_hash = None  # to avoid redundant UI updates
 
         self._cam_var     = tk.StringVar(value="Scanning…")
+        self._model_var   = tk.StringVar(value="YOLOv8 Small")
         self._status_var  = tk.StringVar(value="Loading model…")
         self._fps_var     = tk.StringVar(value="")
         self._det_var     = tk.StringVar(value="Objects: –")
@@ -267,7 +275,11 @@ class App:
         threading.Thread(target=lambda: self.root.after(
             0, lambda: self._populate_dropdown(scan_cameras())
         ), daemon=True).start()
-        ModelLoader(self._on_ready, self._on_status).start()
+        self._start_model_loader()
+
+    def _start_model_loader(self):
+        model_path = MODEL_OPTIONS[self._model_var.get()]
+        ModelLoader(self._on_ready, self._on_status, model_path).start()
 
     # ── camera ────────────────────────────────────────────────────────────────
     def _populate_dropdown(self, cams):
@@ -286,12 +298,10 @@ class App:
     def _pick_cam(self, idx, lbl):
         if not self.worker:
             return
-        # Disable dropdown temporarily to prevent multiple switches
         self._cam_menu.config(state="disabled")
         self._cam_var.set(lbl)
         log.info("Switching to camera %d", idx)
         self._close_cam()
-        # Give camera time to release
         self.root.after(200, lambda: self._open_cam(idx))
 
     def _open_cam(self, idx):
@@ -302,25 +312,26 @@ class App:
             self._status_var.set(f"Cannot open /dev/video{idx}")
             self._cam_menu.config(state="normal")
             return
+        # Request 640x480 but we'll display smaller
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         self.cap.set(cv2.CAP_PROP_FPS,          15)
         log.info("Camera open — %dx%d",
                  int(self.cap.get(3)), int(self.cap.get(4)))
         self._running  = True
-        self._busy     = False          # Reset busy flag
+        self._busy     = False
         self._last_inf = 0.0
-        self._result   = None           # Clear old detections
+        self._result   = None
+        self._frame_counter = 0
         self._status_var.set(
-            f"Live · /dev/video{idx} · detect every {INFER_INTERVAL:.1f}s"
+            f"Live · /dev/video{idx} · {self._model_var.get()} · {INFER_IMGSZ}px"
         )
         self._dot.config(fg=C["green"])
-        self._frame_loop()              # Start fresh loop
+        self._frame_loop()
         self._cam_menu.config(state="normal")
 
     def _close_cam(self):
         self._running = False
-        # Cancel any scheduled frame update
         if self._frame_after_id is not None:
             self.root.after_cancel(self._frame_after_id)
             self._frame_after_id = None
@@ -356,7 +367,6 @@ class App:
         t0 = time.perf_counter()
 
         if self.cap is None or not self.cap.isOpened():
-            # Camera lost, try to recover? For now just stop.
             log.warning("Camera not available, stopping loop.")
             self._running = False
             return
@@ -367,13 +377,19 @@ class App:
             self._frame_after_id = self.root.after(100, self._frame_loop)
             return
 
+        self._frame_counter += 1
+
         annotated = frame.copy()
         if self._result and not self._result.get("error"):
             self._draw(annotated, self._result)
         self._show(annotated)
 
         now = time.time()
-        if not self._busy and (now - self._last_inf) >= INFER_INTERVAL:
+        # Frame skipping + interval throttling
+        should_infer = (self._frame_counter % FRAME_SKIP == 0 and
+                        not self._busy and
+                        (now - self._last_inf) >= INFER_INTERVAL)
+        if should_infer:
             self._last_inf = now
             self._busy     = True
             self._dot.config(fg=C["warn"])
@@ -381,8 +397,9 @@ class App:
 
         elapsed = time.perf_counter() - t0
         self._fps_var.set(f"{1/max(elapsed,1e-6):.0f} fps")
+        # Aim for ~25 fps UI update
         self._frame_after_id = self.root.after(
-            max(1, int((1/20 - elapsed) * 1000)), self._frame_loop
+            max(1, int((1/25 - elapsed) * 1000)), self._frame_loop
         )
 
     def _draw(self, frame, result):
@@ -405,8 +422,9 @@ class App:
                         (255, 229, 0), 1, cv2.LINE_AA)
 
     def _show(self, frame):
-        rgb   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        img   = Image.fromarray(rgb).resize(
+        # Resize display frame to reduce CPU load
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(rgb).resize(
             (DISPLAY_W, DISPLAY_H), Image.BILINEAR)
         photo = ImageTk.PhotoImage(img)
         self._photo = photo
@@ -430,7 +448,12 @@ class App:
         self._face_var.set(f"Faces:   {len(faces)}")
         self._time_var.set(f"Infer:   {r['elapsed']:.2f}s")
 
-        # rebuild per-object rows
+        # Only rebuild sidebar if detection list changed (simple hash)
+        new_hash = hash(tuple((d["label"], d["score"]) for d in dets))
+        if new_hash == self._last_seen_hash:
+            return
+        self._last_seen_hash = new_hash
+
         for w in self._seen_frame.winfo_children():
             w.destroy()
         seen = {}
@@ -439,11 +462,8 @@ class App:
         for label, score in sorted(seen.items(), key=lambda x: -x[1]):
             row = tk.Frame(self._seen_frame, bg=C["panel"])
             row.pack(fill="x", pady=1)
-            try:
-                idx = COCO.index(label)
-            except ValueError:
-                idx = 0
-            r_rgb = _PALETTE_RGB[idx % len(_PALETTE_RGB)]
+            cls_idx = next((d["class_idx"] for d in dets if d["label"] == label), 0)
+            r_rgb = _PALETTE_RGB[cls_idx % len(_PALETTE_RGB)]
             hex_c = f"#{r_rgb[0]:02x}{r_rgb[1]:02x}{r_rgb[2]:02x}"
             tk.Label(row, text=f"  {label}",
                      font=("Courier", 9), fg=hex_c,
@@ -456,7 +476,7 @@ class App:
     # ── UI ────────────────────────────────────────────────────────────────────
     def _build_ui(self):
         r = self.root
-        r.title("BaluVision v7.0")
+        r.title("BaluVision v8.1")
         r.configure(bg=C["bg"])
         r.resizable(False, False)
 
@@ -496,6 +516,19 @@ class App:
             cam_row, self._cam_var, "Scanning…", style="Cam.TMenubutton")
         self._cam_menu.pack(side="left", fill="x", expand=True)
 
+        # model selector
+        model_row = tk.Frame(r, bg=C["bg"])
+        model_row.pack(fill="x", padx=12, pady=(0, 4))
+        tk.Label(model_row, text="MODEL",
+                 font=("Courier", 8, "bold"), fg=C["dim"],
+                 bg=C["bg"], width=6, anchor="w").pack(side="left")
+        model_menu = ttk.OptionMenu(
+            model_row, self._model_var, "YOLOv8 Small",
+            *MODEL_OPTIONS.keys(),
+            command=self._on_model_change,
+            style="Cam.TMenubutton")
+        model_menu.pack(side="left", fill="x", expand=True)
+
         # body
         body = tk.Frame(r, bg=C["bg"])
         body.pack(padx=12, pady=2)
@@ -519,7 +552,7 @@ class App:
                  fg=C["green"], bg=C["panel"]).pack(
                      anchor="w", padx=10, pady=(10, 2))
         tk.Label(side,
-                 text="YOLOv8 Nano\n80 COCO classes",
+                 text="YOLOv8 · 80 COCO",
                  font=("Courier", 7), fg=C["dim"],
                  bg=C["panel"], justify="left").pack(
                      anchor="w", padx=10, pady=(0, 8))
@@ -547,46 +580,13 @@ class App:
 
         tk.Label(side,
                  text=f"\nthreshold: {THRESHOLD*100:.0f}%\n"
-                      f"interval:  {INFER_INTERVAL:.1f}s\n"
-                      f"res:       {INFER_WIDTH}x{INFER_HEIGHT}\n"
-                      "haar faces: live",
+                      f"imgsz:     {INFER_IMGSZ}px\n"
+                      f"skip:      every {FRAME_SKIP} frames\n"
+                      "haar:      optimized",
                  font=("Courier", 7), fg=C["dim"],
                  bg=C["panel"], justify="left").pack(
                      anchor="w", padx=10, pady=(8, 0))
 
         # progress bar
         self._prog = ttk.Progressbar(
-            r, mode="indeterminate",
-            length=DISPLAY_W + 213,
-            style="Load.Horizontal.TProgressbar")
-        self._prog.pack(padx=12, pady=(4, 2))
-        self._prog.start(10)
-
-        # status bar
-        bot = tk.Frame(r, bg=C["bg"])
-        bot.pack(fill="x", padx=12, pady=(2, 10))
-        tk.Label(bot, textvariable=self._status_var,
-                 font=("Courier", 8), fg=C["dim"], bg=C["bg"]).pack(side="left")
-        tk.Label(bot, textvariable=self._fps_var,
-                 font=("Courier", 8), fg=C["dim"], bg=C["bg"]).pack(side="right")
-
-        r.protocol("WM_DELETE_WINDOW", self._on_close)
-
-    def _on_close(self):
-        log.info("Closing.")
-        self._running = False
-        if self._frame_after_id:
-            self.root.after_cancel(self._frame_after_id)
-        if self.worker:
-            self.worker.stop()
-        if self.cap:
-            self.cap.release()
-        self.root.destroy()
-
-
-# ── entry ─────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    log.info("BaluVision v7 starting…")
-    root = tk.Tk()
-    App(root)
-    root.mainloop()
+            r, mode
